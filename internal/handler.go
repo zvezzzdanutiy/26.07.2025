@@ -1,61 +1,46 @@
 package internal
 
 import (
-	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-type MyRequest struct {
-	URL  string `json:"url,omitempty"`
-	Name string `json:"name,omitempty"`
-}
-
-type ZipResponse struct {
-	ArchiveURL string `json:"archive_link,omitempty"`
-	Error      string `json:"error,omitempty"`
-}
-
-// Функция получения ссылок на существующие архивы
-func GetReadyLinks() []string {
-	var readyLinks []string
-	for i := 1; i <= 3; i++ {
-		name := fmt.Sprintf("file%d.zip", i)
-		path := filepath.Join("temp", name)
-		if _, err := os.Stat(path); err == nil {
-			readyLinks = append(readyLinks, "http://localhost:8080/temp/"+name)
-		}
-	}
-	return readyLinks
-}
+// Ограничение размера файлов во избежание DDOS
+const maxUploadSize = 20 * 1024 * 1024
 
 func PostZip(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Метод должен быть POST", http.StatusMethodNotAllowed)
+		JSONerror(w, "Метод должен быть POST")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Ошибка чтения тела запроса", err)
+		JSONerror(w, "Ошибка чтения тела запроса")
+	}
 
-	body, _ := io.ReadAll(r.Body)
-	fmt.Println("Тело запроса:", string(body))
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
 	var req MyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Косяк с JSON", http.StatusBadRequest)
+		log.Printf("Косяк с JSON", err)
+		JSONerror(w, "Проблема с JSON")
 		return
 	}
 
 	files, err := os.ReadDir("temp")
 	if err != nil {
-		http.Error(w, "Не могу прочитать папку temp", http.StatusInternalServerError)
+		log.Printf("Не могу прочитать папку temp", err)
+		JSONerror(w, "Не могу прочитать папку temp")
 		return
 	}
 	used := make(map[int]bool)
@@ -84,9 +69,8 @@ func PostZip(w http.ResponseWriter, r *http.Request) {
 	// Создаём пустой архив
 	err = CreateEmptyZip(archivePath)
 	if err != nil {
-		resp := ZipResponse{Error: err.Error()}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		log.Printf("Проблема с созданием пустого архива", err)
+		JSONerror(w, "Проблема с созданием пустого архива")
 		return
 	}
 
@@ -94,56 +78,8 @@ func PostZip(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode("Файл " + archiveName + " добавлен")
 }
 
-// Функция для создания архива по заданному пути
-func CreateZip(archivePath, urlStr string) error {
-	out, err := os.Create(archivePath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	zipWriter := zip.NewWriter(out)
-	defer zipWriter.Close()
-
-	resp, err := http.Get(urlStr)
-	if err != nil {
-		return err
-	}
-	parsedURL, err := url.Parse(urlStr)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	fileName := filepath.Base(parsedURL.Path)
-	if fileName == "" || !strings.Contains(fileName, ".") {
-		// Попробуем определить расширение по Content-Type
-		contentType := resp.Header.Get("Content-Type")
-		ext := ""
-		switch contentType {
-		case "image/jpeg":
-			ext = ".jpeg"
-		case "image/png":
-			ext = ".png"
-		case "application/pdf":
-			ext = ".pdf"
-		}
-		fileName = fileName[:len(fileName)-1] + ext
-	}
-
-	// Имя файла внутри архива — любое, например, file
-	f, err := zipWriter.Create(fileName)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(f, resp.Body)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
 func DownloadZip(w http.ResponseWriter, r *http.Request) {
-	// Пример: /tasks/123/archive
+	//tasks/123/archive
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 4 || parts[1] != "tasks" || parts[3] != "archive" {
 		http.NotFound(w, r)
@@ -153,7 +89,8 @@ func DownloadZip(w http.ResponseWriter, r *http.Request) {
 
 	archivePath := filepath.Join("temp", taskID+".zip")
 	if _, err := os.Stat(archivePath); os.IsNotExist(err) {
-		http.Error(w, "Archive not found", http.StatusNotFound)
+		log.Printf("Архив не найден", err)
+		JSONerror(w, "Архив не найден")
 		return
 	}
 
@@ -165,14 +102,15 @@ func DownloadZip(w http.ResponseWriter, r *http.Request) {
 // Handler для добавления файла по ссылке в существующий архив
 func AddToZipHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Метод должен быть POST", http.StatusMethodNotAllowed)
+		JSONerror(w, "Метод должен быть POST")
 		return
 	}
 
 	// Пример: /tasks/file1/addtozip
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 4 || parts[3] != "addtozip" {
-		http.Error(w, "Не тот path", http.StatusBadRequest)
+		log.Printf("Не тот path")
+		JSONerror(w, "Не тот path")
 		return
 	}
 	archiveName := parts[2] + ".zip"
@@ -180,24 +118,30 @@ func AddToZipHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Проверяем, что архив существует
 	if _, err := os.Stat(archivePath); os.IsNotExist(err) {
-		http.Error(w, "Архив не найден", http.StatusNotFound)
+		log.Printf("Архив не найден", http.StatusNotFound)
+		JSONerror(w, "Архив не найден")
 		return
 	}
 
 	// Читаем ссылку из тела запроса
 	var req MyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Косяк с JSON", http.StatusBadRequest)
+		log.Printf("Косяк с JSON", err)
+		JSONerror(w, "Проблема с JSON")
 		return
 	}
-
-	// Добавляем файл в архив
+	if err := validateFileURL(req.URL); err != nil {
+		log.Printf("Проблема с валидацией", err)
+		JSONerror(w, "Проблема с валидацией")
+		return
+	}
 
 	// Проверяем количество файлов в архиве
 	fileCount := countFilesInZip(archivePath)
 
 	if fileCount == 3 {
-		http.Error(w, "Архив содержит 3 файла. Больше добавлять нельзя.", http.StatusBadRequest)
+		log.Printf("Архив содержит 3 файла. Больше добавлять нельзя.", http.StatusBadRequest)
+		JSONerror(w, "Архив содержит 3 файла. Больше добавлять нельзя.")
 		resp := ZipResponse{
 			ArchiveURL: "http://localhost:8080/temp/" + archiveName,
 		}
@@ -215,116 +159,26 @@ func AddToZipHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-// Функция для добавления файла в существующий архив
-func AddToZip(archivePath, urlStr string) error {
-	zipFile, err := os.OpenFile(archivePath, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer zipFile.Close()
-
-	stat, err := zipFile.Stat()
-	if err != nil {
-		return err
-	}
-	zipBytes := make([]byte, stat.Size())
-	_, err = zipFile.Read(zipBytes)
-	if err != nil && err != io.EOF {
-		return err
-	}
-
-	buf := new(bytes.Buffer)
-	zipWriter := zip.NewWriter(buf)
-
-	// Пересоздание архива с копированием старых файлов
-	oldZipReader, err := zip.NewReader(bytes.NewReader(zipBytes), stat.Size())
-	if err != nil {
-		return err
-	}
-	for _, f := range oldZipReader.File {
-		w, err := zipWriter.Create(f.Name)
-		if err != nil {
-			return err
-		}
-		r, err := f.Open()
-		if err != nil {
-			return err
-		}
-		_, err = io.Copy(w, r)
-		r.Close()
-		if err != nil {
-			return err
-		}
-	}
-
-	resp, err := http.Get(urlStr)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	parsedURL, err := url.Parse(urlStr)
-	if err != nil {
-		return err
-	}
-	fileName := filepath.Base(parsedURL.Path)
-	if fileName == "" || !strings.Contains(fileName, ".") {
-		fileName = "file"
-	}
-
-	w, err := zipWriter.Create(fileName)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	zipWriter.Close()
-
-	return os.WriteFile(archivePath, buf.Bytes(), 0644)
-}
-
-// Функция для создания пустого архива
-func CreateEmptyZip(archivePath string) error {
-	out, err := os.Create(archivePath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	zipWriter := zip.NewWriter(out)
-	defer zipWriter.Close()
-
-	return nil
-}
-
-func countFilesInZip(archivePath string) int {
-	reader, err := zip.OpenReader(archivePath)
-	if err != nil {
-		return 0
-	}
-	defer reader.Close()
-	return len(reader.File)
-}
-
 // Хендлер получения статуса
 func GetZipStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Метод должен быть GET", http.StatusMethodNotAllowed)
+		log.Printf("Метод getstatus - прежде всего GET")
+		JSONerror(w, "Метод должен быть GET")
 		return
 	}
 
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 3 || parts[1] != "getstatus" {
-		http.Error(w, "Не тот path", http.StatusBadRequest)
+		log.Printf("Не тот path", http.StatusBadRequest)
+		JSONerror(w, "Не тот path")
 		return
 	}
 	archiveName := parts[2] + ".zip"
 	archivePath := filepath.Join("temp", archiveName)
 
 	if _, err := os.Stat(archivePath); os.IsNotExist(err) {
-		http.Error(w, "Архив не найден", http.StatusNotFound)
+		log.Printf("Архив не найден", http.StatusNotFound)
+		JSONerror(w, "Архив не найден")
 		return
 	}
 
